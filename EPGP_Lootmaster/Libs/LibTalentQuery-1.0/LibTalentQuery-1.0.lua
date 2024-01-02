@@ -1,6 +1,6 @@
 --[[
 Name: LibTalentQuery-1.0
-Revision: $Rev: 77 $
+Revision: $Rev: 84 $
 Author: Rich Martel (richmartel@gmail.com)
 Documentation: http://wowace.com/wiki/LibTalentQuery-1.0
 SVN: svn://svn.wowace.com/wow/libtalentquery-1-0/mainline/trunk
@@ -27,7 +27,7 @@ Example Usage:
 	end
 ]]
 
-local MAJOR, MINOR = "LibTalentQuery-1.0", 90000 + tonumber(("$Rev: 77 $"):match("(%d+)"))
+local MAJOR, MINOR = "LibTalentQuery-1.0", 90000 + tonumber(("$Rev: 84 $"):match("(%d+)"))
 
 local lib = LibStub:NewLibrary(MAJOR, MINOR)
 if not lib then return end
@@ -38,7 +38,8 @@ if not lib.events then
 	lib.events = LibStub("CallbackHandler-1.0"):New(lib)
 end
 
-local enteredWorld
+local validateTrees
+local enteredWorld = IsLoggedIn()
 local frame = lib.frame
 if not frame then
 	frame = CreateFrame("Frame", MAJOR .. "_Frame")
@@ -48,6 +49,7 @@ frame:UnregisterAllEvents()
 frame:RegisterEvent("INSPECT_TALENT_READY")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_LEAVING_WORLD")
+frame:RegisterEvent("PLAYER_LOGIN")
 frame:SetScript("OnEvent", function(this, event, ...)
 	return lib[event](lib, ...)
 end)
@@ -111,6 +113,8 @@ local function GuidToUnitID(guid)
         return "target"
 	elseif (UnitGUID("focus") == guid) then
 		return "focus"
+	elseif (UnitGUID("mouseover") == guid) then
+		return "mouseover"
     end
 
 	for i = min, max + 3 do
@@ -137,7 +141,7 @@ end
 
 -- Query
 function lib:Query(unit)
-	if (UnitLevel(unit) < 10) then
+	if (UnitLevel(unit) < 10 or UnitName(unit) == UNKNOWN) then
 		return
 	end
 
@@ -230,6 +234,7 @@ function lib:NotifyInspect(unit)
 		return
 	end
 	self.lastInspectUnit = unit
+	self.lastInspectGUID = UnitGUID(unit)
 	self.lastInspectTime = GetTime()
 	self.lastInspectName = UnitFullName(unit)
 	self.lastInspectPending = self.lastInspectPending + 1
@@ -243,6 +248,8 @@ function lib:Reset()
 	self.lastInspectUnit = nil
 	self.lastInspectTime = nil
 	self.lastInspectName = nil
+	self.lastInspectGUID = nil
+	self.lastInspectTree = nil
 end
 
 -- INSPECT_TALENT_READY
@@ -251,42 +258,56 @@ function lib:INSPECT_TALENT_READY()
 
 	-- Results are valid only when we have received as many events as we have posted notifies
 	if (self.lastInspectName and self.lastInspectPending == 0) then
-		-- Check for roster changes mid inspect:
-		if (UnitIsUnit(self.lastInspectUnit, self.lastInspectName) or self.lastInspectUnit == "mouseover") then
+		-- Check unit ID is still pointing to same actual unit
+		if (UnitGUID(self.lastInspectUnit) == self.lastInspectGUID) then
+			local guid = inspectQueue[self.lastInspectName]
+			inspectQueue[self.lastInspectName] = nil
+
 			local name, realm = strsplit("-", self.lastInspectName)
-			if (inspectQueue[self.lastInspectName]) then
-				local guid = inspectQueue[self.lastInspectName]
-				inspectQueue[self.lastInspectName] = nil
 
-				self.lastQueuedInspectReceived = GetTime()
+			self.lastQueuedInspectReceived = GetTime()
 
-				-- Notify of expected talent results
-				local isnotplayer = not UnitIsUnit("player", self.lastInspectName)
-				local group = GetActiveTalentGroup(isnotplayer)
-				local tree1, _, spent1 = GetTalentTabInfo(1, isnotplayer, nil, group)
-				if (tree1 ~= self.lastInspectTree) then
-					-- Expected talent tree name to be the same as it was when we triggered the NotifyInspect()
-					garbageQueue[self.lastInspectName] = guid
+			-- Notify of expected talent results
+			local isnotplayer = not UnitIsUnit("player", self.lastInspectName)
+			local group = GetActiveTalentGroup(isnotplayer)
+			local tree1, _, spent1 = GetTalentTabInfo(1, isnotplayer, nil, group)
+			if (tree1 ~= self.lastInspectTree) then
+				-- Expected talent tree name to be the same as it was when we triggered the NotifyInspect()
+				garbageQueue[self.lastInspectName] = self.lastInspectGUID
+				self:Reset()
+				self:CheckInspectQueue()
+				return
+
+			elseif (validateTrees) then
+				-- Double checking here. Check the tree name matches what we expect for this class
+				local _, class = UnitClass(self.lastInspectUnit)
+				if (tree1 ~= validateTrees[class]) then
+					garbageQueue[self.lastInspectName] = self.lastInspectGUID
+					self:Reset()
+					self:CheckInspectQueue()
 					return
 				end
-
-				local tree2, _, spent2 = GetTalentTabInfo(2, isnotplayer, nil, group)
-				local tree3, _, spent3 = GetTalentTabInfo(3, isnotplayer, nil, group)
-				if ((spent1 or 0) + (spent2 or 0) + (spent3 or 0) > 0) then
-					self.events:Fire("TalentQuery_Ready", name, realm, self.lastInspectUnit)
-				else
-					-- Tree came back with zero points spent, probably an issue while logging in
-					garbageQueue[self.lastInspectName] = guid
-				end
-			else
-				-- Also notify of non-expected ones, as it's entirely useful to refresh them if they're there
-				-- It is up to the receiving applicating to determine whether they want to receive the information
-				self.events:Fire("TalentQuery_Ready_Outsider", name, realm, self.lastInspectUnit)
 			end
 
-			self:Reset()
-			self:CheckInspectQueue()
+			local tree2, _, spent2 = GetTalentTabInfo(2, isnotplayer, nil, group)
+			local tree3, _, spent3 = GetTalentTabInfo(3, isnotplayer, nil, group)
+			if ((spent1 or 0) + (spent2 or 0) + (spent3 or 0) > 0) then
+				if (guid) then
+					-- It was in our queue
+					self.events:Fire("TalentQuery_Ready", name, realm, self.lastInspectUnit)
+				else
+					-- Also notify of non-expected ones, as it's entirely useful to refresh them if they're there
+					-- It is up to the receiving applicating to determine whether they want to receive the information
+					self.events:Fire("TalentQuery_Ready_Outsider", name, realm, self.lastInspectUnit)
+				end
+			else
+				-- Tree came back with zero points spent, probably an issue while logging in
+				garbageQueue[self.lastInspectName] = guid
+			end
 		end
+
+		self:Reset()
+		self:CheckInspectQueue()
 	end
 end
 
@@ -298,6 +319,40 @@ end
 
 function lib:PLAYER_LEAVING_WORLD()
 	enteredWorld = nil
+end
+
+function lib:PLAYER_LOGIN()
+	validateTrees = {
+		DRUID = "Balance",
+		PRIEST = "Discipline",
+		ROGUE = "Assassination",
+		HUNTER = "Beast Mastery",
+		WARLOCK = "Affliction",
+		WARRIOR = "Arms",
+		DEATHKNIGHT = "Blood",
+		PALADIN = "Holy",
+		SHAMAN = "Elemental",
+		MAGE = "Arcane",
+	}
+
+	if (GetLocale() ~= "enUS" and GetLocale() ~= "enGB") then
+		-- LibBabble-TalentTree-3.0 only loaded if present and not enUS
+		local LBT = LibStub("LibBabble-TalentTree-3.0", true)
+		if (not LBT) then
+			LoadAddOn("LibBabble-TalentTree-3.0")
+			LBT = LibStub("LibBabble-TalentTree-3.0", true)
+		end
+		LBT = LBT and LBT:GetLookupTable()
+		if (LBT) then
+			for class,tree1 in pairs(validateTrees) do
+				validateTrees[class] = LBT[tree1]
+			end
+		else
+			validateTrees = nil
+		end
+	end
+	
+	self.PLAYER_LOGIN = nil
 end
 
 lib:Reset()
